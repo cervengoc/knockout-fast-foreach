@@ -86,6 +86,7 @@ function FastForEach(spec) {
   this.indexesToDelete = [];
   this.rendering_queued = false;
   this.pendingDeletes = [];
+  this.partition = spec.partition || FastForEach.defaultPartitionSize;
 
   // Remove existing content.
   ko.virtualElements.emptyNode(this.element);
@@ -107,11 +108,19 @@ function FastForEach(spec) {
 }
 
 FastForEach.PENDING_DELETE_INDEX_KEY = PENDING_DELETE_INDEX_KEY;
+FastForEach.defaultPartitionSize = 0;
 
 FastForEach.animateFrame = window.requestAnimationFrame || window.webkitRequestAnimationFrame ||
   window.mozRequestAnimationFrame || window.msRequestAnimationFrame ||
   function (cb) { return window.setTimeout(cb, 1000 / 60); };
 
+FastForEach.tryAnimateFrame = function(cb) {
+  if (FastForEach.animateFrame) {
+    FastForEach.animateFrame.call(window, cb);
+    return true;
+  }
+  return false;
+}
 
 FastForEach.prototype.dispose = function () {
   if (this.changeSubs) {
@@ -133,13 +142,13 @@ FastForEach.prototype.onArrayChange = function (changeSet) {
   // - sends the original array indexes for deletes
   // - sends the new array indexes for adds
   // - sorts them all by index in ascending order
-  // because of this, when checking for possible batch additions, any delete can be between to adds with neighboring indexes, so only additions should be checked
+  // because of this, when checking for possible batch additions, any delete can be between two adds with neighboring indexes, so only additions should be checked
   for (var i = 0, len = changeSet.length; i < len; i++) {
 
     if (changeMap.added.length && changeSet[i].status == 'added') {
       var lastAdd = changeMap.added[changeMap.added.length - 1];
       var lastIndex = lastAdd.isBatch ? lastAdd.index + lastAdd.values.length - 1 : lastAdd.index;
-      if (lastIndex + 1 == changeSet[i].index) {
+      if (lastIndex + 1 == changeSet[i].index && (!this.partition || !lastAdd.isBatch || lastAdd.values.length < this.partition)) {
         if (!lastAdd.isBatch) {
           // transform the last addition into a batch addition object
           lastAdd = {
@@ -166,29 +175,45 @@ FastForEach.prototype.onArrayChange = function (changeSet) {
   // Once a change is registered, the ticking count-down starts for the processQueue.
   if (this.changeQueue.length > 0 && !this.rendering_queued) {
     this.rendering_queued = true;
-    FastForEach.animateFrame.call(window, function () { self.processQueue(); });
+    FastForEach.tryAnimateFrame(function () { self.processQueue(); });
   }
 };
 
 
 // Reflect all the changes in the queue in the DOM, then wipe the queue.
-FastForEach.prototype.processQueue = function () {
+FastForEach.prototype.processQueue = function (offset, lowestIndexChanged) {
+  offset = offset || 0;
   var self = this;
-  var lowestIndexChanged = MAX_LIST_SIZE;
+  if (lowestIndexChanged === undefined)
+    lowestIndexChanged = MAX_LIST_SIZE;
 
   // Callback so folks can do things before the queue flush.
-  if (typeof this.beforeQueueFlush === 'function') {
+  if (!offset && typeof this.beforeQueueFlush === 'function') {
     this.beforeQueueFlush(this.changeQueue);
   }
 
-  ko.utils.arrayForEach(this.changeQueue, function (changeItem) {
+  var i = offset;
+  var processedAdds = 0;
+  for (; i < this.changeQueue.length; ++i) {
+    if (this.partition && processedAdds >= this.partition) break;
+
+    var changeItem = this.changeQueue[i];
     if (typeof changeItem.index === 'number') {
       lowestIndexChanged = Math.min(lowestIndexChanged, changeItem.index);
     }
     // console.log(self.data(), "CI", JSON.stringify(changeItem, null, 2), JSON.stringify($(self.element).text()))
     self[changeItem.status](changeItem);
     // console.log("  ==> ", JSON.stringify($(self.element).text()))
-  });
+    if (changeItem.status == "added")
+      processedAdds += (changeItem.isBatch ? changeItem.values.length : 1);
+  }
+
+  if (i < this.changeQueue.length) {
+    if (!FastForEach.tryAnimateFrame(function () { self.processQueue(i, lowestIndexChanged); }))
+      self.processQueue(i);
+    return;
+  }
+
   this.flushPendingDeletes();
   this.rendering_queued = false;
 
@@ -196,11 +221,12 @@ FastForEach.prototype.processQueue = function () {
   if (!this.noIndex) {
     this.updateIndexes(lowestIndexChanged);
   }
-
+  
   // Callback so folks can do things.
   if (typeof this.afterQueueFlush === 'function') {
     this.afterQueueFlush(this.changeQueue);
   }
+  
   this.changeQueue = [];
 };
 
@@ -249,14 +275,13 @@ FastForEach.prototype.added = function (changeItem) {
     this.firstLastNodesList.splice(index + i, 0, { first: childNodes[0], last: childNodes[childNodes.length - 1] });
   }
 
+  var insertedNodes = this.insertAllAfter(allChildNodes, referenceElement);
+
   if (typeof this.afterAdd === 'function') {
     this.afterAdd({
-      nodeOrArrayInserted: this.insertAllAfter(allChildNodes, referenceElement),
+      nodesInserted: insertedNodes,
       foreachInstance: this
-    }
-    );
-  } else {
-    this.insertAllAfter(allChildNodes, referenceElement);
+    });
   }
 };
 
@@ -294,7 +319,7 @@ FastForEach.prototype.insertAllAfter = function (nodeOrNodeArrayToInsert, insert
   } else if (supportsDocumentFragment) {
     frag = document.createDocumentFragment();
 
-    for (i = 0, len = nodeOrNodeArrayToInsert.length; i !== len; ++i) {
+    for (i = 0, len = nodeOrNodeArrayToInsert.length; i < len; ++i) {
       frag.appendChild(nodeOrNodeArrayToInsert[i]);
     }
     ko.virtualElements.insertAfter(containerNode, frag, insertAfterNode);
@@ -307,6 +332,7 @@ FastForEach.prototype.insertAllAfter = function (nodeOrNodeArrayToInsert, insert
       ko.virtualElements.insertAfter(containerNode, child, insertAfterNode);
     }
   }
+
   return nodeOrNodeArrayToInsert;
 };
 
@@ -357,7 +383,8 @@ FastForEach.prototype.removeNodes = function (nodes) {
     var parent = nodes[0].parentNode;
     for (var i = nodes.length - 1; i >= 0; --i) {
       ko.cleanNode(nodes[i]);
-      parent.removeChild(nodes[i]);
+      if (parent)
+        parent.removeChild(nodes[i]);
     }
   };
 
